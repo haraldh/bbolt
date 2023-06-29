@@ -4,6 +4,7 @@ package bbolt
 
 import (
 	"fmt"
+	"golang.org/x/sys/unix"
 	"syscall"
 	"time"
 	"unsafe"
@@ -49,7 +50,35 @@ func funlock(db *DB) error {
 // mmap memory maps a DB's data file.
 func mmap(db *DB, sz int) error {
 	// Map the data file to memory.
-	b, err := syscall.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
+
+	prot := syscall.PROT_READ
+	if !db.readOnly {
+		prot = syscall.PROT_READ | syscall.PROT_WRITE
+
+		db.ops.writeAt = func(p []byte, off int64) (n int, err error) {
+			sz = (int(off) + len(p) + db.pageSize - 1) / db.pageSize * db.pageSize
+			if sz > db.filesz {
+				if err := db.file.Truncate(int64(sz)); err != nil {
+					return 0, fmt.Errorf("file resize error: %s", err)
+				}
+				/*
+					if err := db.file.Sync(); err != nil {
+						return 0, fmt.Errorf("file sync error: %s", err)
+					}
+
+				*/
+				db.filesz = sz
+			}
+			copy(db.dataref[off:off+int64(len(p))], p)
+			err = unix.Msync(db.dataref[off:off+int64(len(p))], unix.MS_SYNC)
+			if err != nil {
+				return 0, err
+			}
+			return len(p), nil
+		}
+	}
+
+	b, err := syscall.Mmap(int(db.file.Fd()), 0, sz, prot, syscall.MAP_SHARED|db.MmapFlags)
 	if err != nil {
 		return err
 	}
